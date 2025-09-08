@@ -1,62 +1,74 @@
-from flask import Flask, request, jsonify
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+import json
 from yt_dlp import YoutubeDL
 import logging
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-app = Flask(__name__)
+class handler(BaseHTTPRequestHandler):
 
-# This single function will handle all requests to the root URL.
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>', methods=['GET'])
-def get_video_info(path):
-    video_id = request.args.get('id')
+    def do_GET(self):
+        # Parse query parameters
+        query_components = parse_qs(urlparse(self.path).query)
+        video_id = query_components.get('id', [None])[0]
 
-    if not video_id:
-        return jsonify({"error": "No YouTube video ID provided. Use ?id=VIDEO_ID"}), 400
+        if not video_id:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "No YouTube video ID provided. Use ?id=VIDEO_ID"}).encode('utf-8'))
+            return
 
-    YDL_OPTIONS = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'noplaylist': True,
-        'quiet': True
-    }
+        YDL_OPTIONS = {
+            'noplaylist': True,
+            'quiet': True,
+            'format': 'best[ext=mp4]/best' # Simplified format selection
+        }
 
-    try:
-        with YoutubeDL(YDL_OPTIONS) as ydl:
-            logging.info(f"Fetching info for video ID: {video_id}")
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            logging.info("Successfully extracted info.")
+        try:
+            with YoutubeDL(YDL_OPTIONS) as ydl:
+                logging.info(f"Fetching info for video ID: {video_id}")
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                logging.info("Successfully extracted info.")
 
-            formats_to_return = []
-            if 'formats' in info:
-                for f in info['formats']:
-                    # We are interested in formats that have both video and audio, or just video (for DASH)
-                    if f.get('vcodec') != 'none' and f.get('url'):
-                        resolution = f.get('resolution', 'N/A')
-                        if f.get('height'):
-                            resolution = f"{f['height']}p"
-                        
-                        formats_to_return.append({
-                            'resolution': resolution,
-                            'url': f['url'],
-                            'has_audio': f.get('acodec') != 'none'
-                        })
+                formats_to_return = []
+                if 'formats' in info:
+                    for f in info.get('formats', []):
+                        # Ensure we have a URL and it's a progressive format (video+audio) or just video
+                        if f.get('url') and (f.get('vcodec') != 'none'):
+                            height = f.get('height')
+                            if height:
+                                formats_to_return.append({
+                                    'quality': f"{height}p",
+                                    'url': f['url']
+                                })
+                
+                # Filter for unique heights, keeping the first one found (yt-dlp usually lists best first)
+                unique_formats = []
+                seen_qualities = set()
+                for f in formats_to_return:
+                    if f['quality'] not in seen_qualities:
+                        unique_formats.append(f)
+                        seen_qualities.add(f['quality'])
+                
+                response_data = {
+                    "title": info.get("title", "No title"),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "formats": sorted(unique_formats, key=lambda x: int(x['quality'][:-1]), reverse=True)
+                }
+
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(response_data).encode('utf-8'))
+
+        except Exception as e:
+            logging.error(f"Error processing video ID {video_id}: {str(e)}")
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Could not process the video. It may be private, deleted, or region-locked."}).encode('utf-8'))
             
-            # Remove duplicate resolutions, keeping the best quality (often the first one found)
-            unique_formats = {f['resolution']: f for f in reversed(formats_to_return)}.values()
-
-
-            return jsonify({
-                "title": info.get("title", "No title"),
-                "thumbnail": info.get("thumbnail", ""),
-                "formats": sorted(list(unique_formats), key=lambda x: int(x['resolution'][:-1] or 0), reverse=True)
-            })
-
-    except Exception as e:
-        logging.error(f"Error processing video ID {video_id}: {str(e)}")
-        return jsonify({"error": "Could not process the video. It may be private, deleted, or region-locked."}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True)
-
+        return
